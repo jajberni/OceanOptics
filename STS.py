@@ -1,11 +1,12 @@
 
-""" File:           devices.py
-    Author:         Andreas Poehlmann
-    Last change:    2012/09/04
+""" File:           STS.py
+    Author:         Jose A. J. Berni
+    Last change:    2013/05/16
 
     Python Interface for OceanOptics Spectometers.
+    Based on Andreas Poehlmann's USB2000 Driver
     Current device classes:
-        * USB2000+
+        * STS
 """
 
 #----------------------------------------------------------
@@ -14,7 +15,6 @@ import struct
 from _defines import OceanOpticsError as _OOError
 import numpy as np
 import time
-import sys
 #----------------------------------------------------------
 
 
@@ -56,12 +56,14 @@ class STS(object):
         self._END_BYTES = 0xC2C3C4C5
         self._PROTOCOL_VERSION = 0x0100
 
+        self._MSG_GET_SERIAL = 0x00000100
+        self._MSG_GET_SERIAL_LENGHT = 0x00000101
+
         self._MSG_GET_CORRECTED_SPECTRUM = 0x00101000
         self._MSG_SET_INTEGRATION_TIME = 0x00110010
 
         self._MSG_GET_HW_VERSION=0x00000080
         self._MSG_GET_SW_VERSION=0x00000090
-        self._MSG_GET_SERIAL_NUMBER=0x00000100
 
         self._MSG_GET_AVG_SCANS=0x00110510
         self._MSG_SET_AVG_SCANS=0x00120010
@@ -75,26 +77,35 @@ class STS(object):
         self._MSG_GET_NONLINEAR_COEFF_COUNT = 0x00181100
         self._MSG_GET_NONLINEAR_COEFF = 0x00181101
 
+        self._MSG_GET_STRAYLIGHT_COEFF_COUNT = 0x00183100
+        self._MSG_GET_STRAYLIGHT_COEFF = 0x00183101
+
+
+        self._MSG_GET_IRRADIANCE_COEFF = 0x00182001
+
+
+        self._scan_averages = 0
+
 
         # This part makes the initialization a little bit more robust
         self._dev.set_configuration()
+
+
+        # This empties the USB buffer
+        self._initialize()
+
         print "HW Version: %i" % self._get_hw_version()
-        print "HW Version: %i" % self._get_hw_version()
+        print "SW Version: %i" % self._get_sw_version()
+        self.Serial = self._get_serial()
+        print "Serial: %s" % self.Serial
         self.integration_time(10000) # sets self._it
+        self.set_scan_averages(10)
         self._request_spectrum()
         self._wl = self._get_wavelength_calibration()
         self._nl = self._get_nonlinearity_calibration()
-        import pdb; pdb.set_trace()
-        sys.exit(0)
-
-        self._initialize()
-        #<robust>#
-        for i in range(10):
-            try:
-                self._usbcomm = self._query_status()['usb_speed']
-                break
-            except usb.core.USBError: pass
-        else: raise _OOError('Initialization USBCOM')
+        self._sl = self._get_stray_light_calibration()
+        print self._sl
+        #self._scan_averages = self._get_scan_averages()
 
 
         for i in range(10):
@@ -103,32 +114,40 @@ class STS(object):
                 break
             except: pass
         else: raise _OOError('Initialization SPECTRUM')
-        #</robust>#
 
-        self._wl = self._get_wavelength_calibration()
-        self._nl = self._get_nonlinearity_calibration()
-
-
-        self._st = self._get_saturation_calibration()
-
-        self.Serial = self._get_serial()
 
 
     def integration_time(self, time_us=None):
         if not (time_us is None):
             self._set_integration_time(time_us)
-        #self._it = self._query_status()['integration_time']
         return time_us
 
+    def set_scan_averages(self, scan_averages=None):
+        if not (scan_averages is None):
+            self._set_scan_averages(scan_averages)
+
     def device_temperature(self):
-        return self._read_pcb_temperature()
+        """Returns the temperature of the detector"""
+        temperatures = self._read_temperatures()
+        return temperatures[0]
 
     def acquire_spectrum(self):
-        raw_intensity = np.array(self._request_spectrum(), dtype=np.float)[20:]
-        wavelength = sum( self._wl[i] * np.arange(20,2048)**i for i in range(4) )
+        raw_intensity = np.array(self._request_spectrum(), dtype=np.float)
+        nl_coeffs = len(self._nl)
+        wavelength = sum( self._wl[i] * np.arange(1024)**i for i in range(4) )
         # fixed linearization, see documentation at:
         # --> http://www.oceanoptics.com/technical/OOINLCorrect%20Linearity%20Coeff%20Proc.pdf
-        intensity =  raw_intensity / sum( self._nl[i] * raw_intensity**i for i in range(8) ) * self._st
+        intensity =  raw_intensity / sum( self._nl[i] * raw_intensity**i for i in range(nl_coeffs) )
+        return np.vstack([wavelength, intensity])
+
+
+    def acquire_radiance_spectrum(self):
+        raw_intensity = np.array(self._request_spectrum(), dtype=np.float)
+        nl_coeffs = len(self._nl)
+        wavelength = sum( self._wl[i] * np.arange(1024)**i for i in range(4) )
+        # fixed linearization, see documentation at:
+        # --> http://www.oceanoptics.com/technical/OOINLCorrect%20Linearity%20Coeff%20Proc.pdf
+        intensity =  raw_intensity / sum( self._nl[i] * raw_intensity**i for i in range(nl_coeffs) )
         return np.vstack([wavelength, intensity])
 
 
@@ -136,13 +155,62 @@ class STS(object):
     # The user doesn't need to see this
     #-----------------------------
     def _initialize(self):
-        """ 0x01 initialize """
-        self._dev.write(self._EP1_out, struct.pack('<B', 0x01))
+        """ Empty USB buffer """
+        print "Initilizing"
+        while(True):
+            try:
+                self._dev.read(self._EP1_in, self._EP1_in_size)
+            except:
+                break
+        #self._dev.write(self._EP1_out, struct.pack('<B', 0x01))
+
+
+    def _get_serial(self):
+
+        serial_leght = int(self._query_coefficient_count(self._MSG_GET_SERIAL_LENGHT))
+        print "Serial length: %i" % serial_leght
+
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_SERIAL,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
+        ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+        if len(ret) == 64:
+            ack = struct.unpack('<HHHHLL6sBB16sL16sL', ret)
+            if ack[3] == 0:
+                return str(ack[9]).replace('\0','')
+            else:
+                print "Error code: %i" % ack[3]
+                return -1
+        else:
+            print "Unexpected msg lenght: %i vs 64" % len(ret)
+            return -1
+
+
+        return "Not Yet!"
 
     def _get_hw_version(self):
         self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
         self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
         self._MSG_GET_HW_VERSION,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
+        ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+
+        if len(ret) == 64:
+            ack = struct.unpack('<HHHHLL6sBBB15sL16sL', ret)
+            if ack[3] == 0:
+                return ack[9]
+            else:
+                print "Error code: %i" % ack[3]
+                return -1
+        else:
+            print "Unexpected msg lenght: %i vs 64" % len(ret)
+            return -1
+
+    def _get_sw_version(self):
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_SW_VERSION,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
         0x14,'',self._END_BYTES))
         ret = self._dev.read(self._EP1_in, self._EP1_in_size)
 
@@ -188,18 +256,59 @@ class STS(object):
                 print "Unexpected msg lenght: %i vs 64" % len(ret)
                 return -1
         except Exception:
+            #No error message
             self._it = time_us
-            print "Probably set..."
+
+    def _set_scan_averages(self, scan_averages):
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBBH14sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_SET_AVG_SCANS,0x00000000,0x00000000,0x0000,0x00,0x02,scan_averages,'',\
+        0x14,'',self._END_BYTES))
+
+        try:
+            ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+            if len(ret) == 64:
+                ack = struct.unpack('<HHHHLL6sBBH14sL16sL', ret)
+                if ack[3] == 0:
+                    print ack[9]
+                    print "Error setting integration time"
+                    return -1
+                else:
+                    print "Error code: %i" % ack[3]
+                    return -1
+            else:
+                print "Unexpected msg lenght: %i vs 64" % len(ret)
+                return -1
+        except Exception:
+            #No error message
+            self._scan_averages = scan_averages
 
 
-    def _read_pcb_temperature(self):
-        """ 0x6C read pcb temperature """
-        self._dev.write(self._EP1_out, struct.pack('<B', 0x6C))
+    def _get_scan_averages(self):
+        #TODO: Not working as expected, returns error
+        """
+        Gets the coefficient count for a given command.
+
+        :param command: E.g. Wavelength calibration, stray light...
+        :returns: The value of the coefficient count stored in EEPROM.
+
+        """
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_AVG_SCANS,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
         ret = self._dev.read(self._EP1_in, self._EP1_in_size)
-        if ret[0] != 0x08:
-            raise Exception('read_pcb_temperature: Wrong answer')
-        adc, = struct.unpack('<h', ret[1:])
-        return 0.003906*adc
+
+        if len(ret) == 64:
+            ack = struct.unpack('<HHHHLL6sBBH14sL16sL', ret)
+            if ack[3] == 0:
+                return ack[9]
+            else:
+                print "Error code: %i" % ack[3]
+                return -1
+        else:
+            print "Unexpected msg lenght: %i vs 64" % len(ret)
+            return -1
 
 
     def _request_spectrum(self):
@@ -214,12 +323,12 @@ class STS(object):
         self._MSG_GET_CORRECTED_SPECTRUM,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
         0x14,'',self._END_BYTES))
 
-        time.sleep( max(self._it , 0) * 1e-6 )
+        time.sleep( max((self._it+100000)*self._scan_averages , 0) * 1e-6 )
         ret = [self._dev.read(self._EP1_in, self._EP1_in_size) for _ in range(33)]
         ret = sum(ret[1:], ret[0])
-        #print "".join('%02x' % i for i in ret)
+
         spectrum = struct.unpack('<HHHHLLLHBB16sL1024H16sL', ret)
-        print(spectrum[12:1036])
+
         return spectrum[12:1036]
 
 
@@ -233,13 +342,30 @@ class STS(object):
             raise _OOError('This spectrometer has less correction factors')
         return [float(self._query_coefficient(i,self._MSG_GET_NONLINEAR_COEFF)) for i in range(nl_coef)]
 
-    def _get_saturation_calibration(self):
-        ret = self._query_information(0x11, raw=True)
-        return 65535.0/float(struct.unpack('<h',ret[6:8])[0])
+    def _get_stray_light_calibration(self):
+        sl_coef = int(self._query_coefficient_count(self._MSG_GET_STRAYLIGHT_COEFF_COUNT))
+
+        return [float(self._query_coefficient(i,self._MSG_GET_STRAYLIGHT_COEFF)) for i in range(sl_coef)]
+
 
     def _read_irradiance_calibration(self):
-        """ 0x6D read irradiance calib factors """
-        raise NotImplementedError
+        """"
+        Return the irradiance calibration stores in the STS.
+
+        :returns: An array with 1024 floating elements.
+        """
+
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_IRRADIANCE_COEFF,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
+
+        ret = [self._dev.read(self._EP1_in, self._EP1_in_size) for _ in range(65)]
+        ret = sum(ret[1:], ret[0])
+        #print "".join('%02x' % i for i in ret)
+        spectrum = struct.unpack('<HHHHLLLHBB16sL1024f16sL', ret)
+        #print(spectrum[12:1036])
+        return spectrum[12:1036]
 
 
     def _query_coefficient_count(self, command):
@@ -295,55 +421,25 @@ class STS(object):
             print "Unexpected msg lenght: %i vs 64" % len(ret)
             return -1
 
+    def _read_temperatures(self):
+        """
+        Reads the sensor temperatures and returns an float array with the.
+        [0] is the temperature of the detector
+        [1] is the temperature of the controller
 
-    #-------------------------------------------
-    # This stuff is not implemented yet.
-    # Don't really need it ...
-    #-------------------------------------------
-    def _set_strobe_enable_status(self):
-        """ 0x03 set strobe enable status """
-        raise NotImplementedError
+        :returns: a float array with two elements.
 
-    def _set_shutdown_mode(self):
-        """ 0x04 set shutdown mode """
-        raise NotImplementedError
+        """
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_ALL_TEMPERATURE,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
 
-    def _write_information(self, address):
-        """ 0x06 write info """
-        raise NotImplementedError
+        ret = self._dev.read(self._EP1_in, self._EP1_in_size)
 
-    def _set_trigger_mode(self, mode):
-        """ 0x0A set trigger mode """
-        raise NotImplementedError
+        ack = struct.unpack('<HHHHLLLHBB3f4sL16sL', ret)
 
-    def _query_plugin_num(self):
-        """ 0x0B query number of plugin accessories """
-        raise NotImplementedError
-
-    def _query_plugin_ident(self):
-        """ 0x0C query plugin identifiers """
-        raise NotImplementedError
-
-    def _detect_plugins(self):
-        """ 0x0D detect plugins """
-        raise NotImplementedError
-
-    def _i2c_read(self):
-        """ 0x60 I2C read """
-        raise NotImplementedError
-
-    def _i2c_write(self, data):
-        """ 0x61 I2C write """
-        raise NotImplementedError
-
-    def _spi_io(self):
-        """ 0x62 spi io """
-        raise NotImplementedError
-
-    def _write_register_info(self):
-        """ 0x6A write register info """
-        raise NotImplementedError
-
+        return [ack[10],ack[12]]
 
 
 if __name__ == '__main__':
