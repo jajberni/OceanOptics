@@ -22,9 +22,9 @@ wl = sp[0]
 spec.set_scan_averages(5)
 for integration_time in np.arange(1e5, 5e6, 1e5):
     print "Integrating spectrum for IT: %ims" % (integration_time*1e-3)
-    spec.integration_time(integration_time)
+    spec.set_integration_time(integration_time)
     sp = spec.acquire_spectrum()
-    detector_temperature = spec.device_temperature()
+    detector_temperature = spec.get_device_temperature()
     temperatures.append(detector_temperature)
     intensities[integration_time] = sp[1]
 
