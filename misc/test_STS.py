@@ -11,7 +11,7 @@ spec = OceanOptics.STS()
 test = spec._read_temperatures()
 print test
 spec.set_scan_averages(5)
-spec.integration_time(2e6)
+spec.set_integration_time(2e6)
 cal = spec._read_irradiance_calibration()
 sp = spec.acquire_spectrum()
 

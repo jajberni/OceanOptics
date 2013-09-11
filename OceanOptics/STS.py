@@ -80,6 +80,11 @@ class STS(object):
         self._MSG_GET_STRAYLIGHT_COEFF_COUNT = 0x00183100
         self._MSG_GET_STRAYLIGHT_COEFF = 0x00183101
 
+        self._MSG_GET_USER_CONFIG_COUNT = 0x00000300
+        self._MSG_GET_USER_CONFIG_LENGTH = 0x00000301
+        self._MSG_GET_USER_CONFIG_STRING = 0x00000302
+        self._MSG_SET_USER_CONFIG_STRING = 0x00000310
+
 
         self._MSG_GET_IRRADIANCE_COEFF = 0x00182001
 
@@ -104,6 +109,9 @@ class STS(object):
         self._wl = self._get_wavelength_calibration()
         self._nl = self._get_nonlinearity_calibration()
         self._sl = self._get_stray_light_calibration()
+        user_strings = self._query_user_string_count()
+        user_length = self._query_user_string_length()
+        print "User strings: %i. Max lenght: %i" % (user_strings,user_length)
 
 
         # Make sure everything is working
@@ -146,7 +154,38 @@ class STS(object):
         return np.vstack([wavelength, intensity])
 
 
-    def acquire_radiance_spectrum(self):
+    def acquire_radiance_spectrum(self, fiber_diameter=400):
+        """Returns the radiance spectrum. Uses the calibration stored in the
+        spectrometer and the following equation according to the SpectraSuite manual:
+
+        IP = (SP - DP) * CP / (T * A * dLP)
+
+        Where: the subscript P indicates a particular pixel for I, dL, S, D, and C.
+        Thus, SP refers to pixel P of the sample spectrum.
+
+        Note that if the lamp is entirely enclosed within an integrating sphere,
+        then the A term is omitted.
+
+        If you are using an Ocean Optics cosine corrector or a direct attach
+        cosine corrector, enter the appropriate value for the fiber_diameter
+        as follows:
+
+        CC-3: 3900 microns
+
+        Parameters
+        ----------
+        fiber_diameter : number
+            The diameter of the collection area in microns. For bare fiber use
+            400 and for the cosine corrector (CC-3) use 3900.
+
+        Returns
+        ---------
+        A numpy array with [[wavelenghts], [radiance]]
+
+        """
+
+        #IP = (SP - DP) * CP / (T * A * dLP)
+
         raise NotImplementedError
 
 
@@ -393,9 +432,131 @@ class STS(object):
             return -1
 
 
+    def _query_user_string_count(self):
+        """
+        Gets the user string count.
+
+        Returns
+        ---------
+        The number of available user strings.
+
+        """
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_USER_CONFIG_COUNT,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
+        ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+
+        if len(ret) == 64:
+            ack = struct.unpack('<HHHHLL6sBBB15sL16sL', ret)
+            if ack[3] == 0:
+                return ack[9]
+            else:
+                print "Error code: %i" % ack[3]
+                return -1
+        else:
+            print "Unexpected msg lenght: %i vs 64" % len(ret)
+            return -1
+
+
+    def _query_user_string_length(self):
+        """
+        Gets the user string count.
+
+        Returns
+        ---------
+        The number of available user strings.
+
+        """
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_USER_CONFIG_LENGTH,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14,'',self._END_BYTES))
+        ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+
+        if len(ret) == 64:
+            ack = struct.unpack('<HHHHLL6sBBH14sL16sL', ret)
+            if ack[3] == 0:
+                return ack[9]
+            else:
+                print "Error code: %i" % ack[3]
+                return -1
+        else:
+            print "Unexpected msg lenght: %i vs 64" % len(ret)
+            return -1
+
+    def _set_user_string(self, index, user_string):
+        """
+        Gets one of the user's strings stored at a given index.
+
+        Parameters
+        ----------
+
+        index : int
+            The index of the string.
+        user_string : str
+            The string to be stored
+        """
+        str_len = len(user_string)
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBB16sL%is16sL'%str_len, \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_SET_USER_CONFIG_STRING,0x00000000,0x00000000,0x0000,0x00,0x00,'',\
+        0x14+str_len,user_string,self._END_BYTES))
+
+        try:
+            ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+            if len(ret) == 64:
+                ack = struct.unpack('<HHHHLL6sBBH14sL16sL', ret)
+                if ack[3] == 0:
+                    print ack[9]
+                    print "Error setting integration time"
+                    return -1
+                else:
+                    print "Error code: %i" % ack[3]
+                    return -1
+            else:
+                print "Unexpected msg lenght: %i vs 64" % len(ret)
+                return -1
+        except Exception:
+            #No error message
+            print "No Error"
+
+
+    def _get_user_string(self, index):
+        """
+        Gets one of the user's strings stored at a given index.
+
+        Parameters
+        ----------
+
+        index : int
+            The index of the string.
+
+        Returns
+        ---------
+
+        The string stored in memory
+        """
+        self._dev.write(self._EP1_out, struct.pack('<HHHHLLLHBBB15sL16sL', \
+        self._START_BYTES,self._PROTOCOL_VERSION,0x0000,0x0000,\
+        self._MSG_GET_USER_CONFIG_STRING,0x00000000,0x00000000,0x0000,0x00,0x01,index,'',\
+        0x14,'',self._END_BYTES))
+        ret = self._dev.read(self._EP1_in, self._EP1_in_size)
+
+        if len(ret) == 64:
+            ack = struct.unpack('<HHHHLL6sBBf12sL16sL', ret)
+            if ack[3] == 0:
+                return ack[9]
+            else:
+                print "Error code: %i" % ack[3]
+                return -1
+        else:
+            print "Unexpected msg lenght: %i vs 64" % len(ret)
+            return -1
+
     def _query_coefficient(self, index, command):
         """
-        Sets the integration time in us.
+        Gets the integration time in us.
 
         :param index: Index of the coefficient to retrieve.
 
